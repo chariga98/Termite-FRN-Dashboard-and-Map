@@ -1,6 +1,6 @@
 # Termite FRN Dashboard
 
-> **R Shiny dashboard and geospatial mapping tool for monitoring termite field research network (FRN) trials across western Kenya** — tracking termite attack patterns, crop vigour, and plant population loss across four growth stages with interactive filtering and variety-level attack analysis.
+> **R Shiny dashboard and geospatial mapping tool for monitoring termite Farmer Research Network (FRN) trials across western Kenya** — tracking termite attack patterns, crop vigour, and plant population loss across four growth stages with interactive filtering and variety-level attack analysis.
 
 ---
 
