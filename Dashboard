@@ -1,0 +1,922 @@
+# app.R
+# Termite FRN Dashboard — full app.R with attack-label inference from Plot_*_...Attack... columns
+# - Safe loader + robust cleaning
+# - tidy_plots handles duplicate metrics and extracts Plot_Name
+# - Filters apply across all pages; toggle to group by Plot or Farmer
+# - Planting date visuals removed
+# - Global x-axis labels rotated 90 degrees for readability
+# - Variety Attack tab: dot-plot, bars, and table guided by TrialSetup varieties
+# - Uses Plot_*_...Attack... columns to infer whether an attack refers to Hybrid or Local
+
+# -----------------------------
+# INSTALL & LOAD PACKAGES
+# -----------------------------
+required_packages <- c(
+  "shiny","dplyr","ggplot2","tidyr","plotly","readxl","leaflet","forcats","stringr","DT"
+)
+
+install_if_missing <- function(pkg){
+  if(!require(pkg, character.only = TRUE)){
+    install.packages(pkg, repos = "https://cloud.r-project.org", dependencies = FALSE)
+    library(pkg, character.only = TRUE)
+  }
+}
+for(p in required_packages){ install_if_missing(p) }
+
+library(shiny)
+library(dplyr)
+library(ggplot2)
+# Global theme update: rotate x-axis labels 90 degrees for readability
+theme_update(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+library(tidyr)
+library(plotly)
+library(readxl)
+library(leaflet)
+library(forcats)
+library(stringr)
+library(DT)
+
+# -----------------------------
+# SAFE LOAD & CLEAN DATA (robust)
+# -----------------------------
+xlsx_path <- "C:/Users/okoth/OneDrive/Desktop/Termite Research Data/Termite_Data_Cleaning/Longrains_Termite_FRN_Data_2025.xlsx"
+
+clean_data_robust <- function(df){
+  facs <- names(df)[vapply(df, is.factor, logical(1))]
+  if(length(facs)) df[facs] <- lapply(df[facs], as.character)
+  for(col in names(df)){
+    colval <- df[[col]]
+    if(is.null(colval)) next
+    if(is.character(colval)){
+      colval <- str_trim(colval)
+      colval[colval == ""]     <- NA_character_
+      colval[colval == "NA"]   <- NA_character_
+      colval[colval == "-"]    <- NA_character_
+      colval[colval == "None"] <- NA_character_
+      colval[colval == "none"] <- NA_character_
+      colval[colval == "N/A"]  <- NA_character_
+      df[[col]] <- colval
+    } else {
+      if(is.list(colval) && !is.data.frame(colval)){
+        warning(sprintf("Column '%s' is a list; coercing to character for safety.", col))
+        df[[col]] <- as.character(colval)
+        df[[col]][df[[col]] == ""] <- NA_character_
+      }
+    }
+  }
+  df
+}
+
+read_and_clean_safe <- function(path, sheet_name){
+  tryCatch({
+    df <- read_excel(path, sheet = sheet_name)
+    clean_data_robust(df)
+  }, error = function(e){
+    stop(sprintf("Failed to read/clean sheet '%s': %s", sheet_name, e$message))
+  })
+}
+
+FarmerProfile_data <- read_and_clean_safe(xlsx_path, "Farmer_Profile")
+TrialSetup_data    <- read_and_clean_safe(xlsx_path, "Trial_setup")
+FirstWeeding_data  <- read_and_clean_safe(xlsx_path, "First_Weeding")
+SecondWeeding_data <- read_and_clean_safe(xlsx_path, "Second_Weeding")
+Tasseling_data     <- read_and_clean_safe(xlsx_path, "Tasseling_Stage")
+Harvest_data       <- read_and_clean_safe(xlsx_path, "Harvesting_Stage")
+
+check_problem_cols <- function(df, sheet_name){
+  bad <- names(df)[vapply(df, function(x) is.list(x) && !is.data.frame(x), logical(1))]
+  if(length(bad)){
+    message(sprintf("Sheet '%s' had list-like columns coerced to character: %s", sheet_name, paste(bad, collapse=", ")))
+  }
+}
+check_problem_cols(FarmerProfile_data, "Farmer_Profile")
+check_problem_cols(TrialSetup_data, "Trial_setup")
+check_problem_cols(FirstWeeding_data, "First_Weeding")
+check_problem_cols(SecondWeeding_data, "Second_Weeding")
+check_problem_cols(Tasseling_data, "Tasseling_Stage")
+check_problem_cols(Harvest_data, "Harvesting_Stage")
+
+# -----------------------------
+# HELPERS: tidy plot columns into long form (robust to duplicates)
+# and extract embedded plot-name columns and derive plot_type
+# -----------------------------
+derive_plot_type <- function(plot_name){
+  if(is.na(plot_name) || plot_name == "") return(NA_character_)
+  pn <- tolower(plot_name)
+  if(str_detect(pn, "hybrid")) return("Hybrid")
+  if(str_detect(pn, "lablab")) return("Lablab")
+  if(str_detect(pn, "local")) return("Local Maize")
+  if(str_detect(pn, "farmer")) return("Farmer Choice")
+  if(str_detect(pn, "plot")) return("Plot")
+  return("Other")
+}
+
+tidy_plots <- function(df){
+  plot_cols <- names(df)[stringr::str_detect(names(df), regex("^Plot_\\d+_", ignore_case = TRUE))]
+  if(length(plot_cols) == 0){
+    plot_cols <- names(df)[stringr::str_detect(names(df), regex("Plot|plot_", ignore_case = TRUE))]
+    if(length(plot_cols) == 0) return(tibble())
+  }
+  
+  id_cols <- intersect(c("farmer_name","Farmer","clusters","subcounty"), names(df))
+  if(!"farmer_name" %in% names(df) && "Farmer" %in% names(df)){
+    df <- df %>% rename(farmer_name = Farmer)
+    id_cols <- intersect(c("farmer_name","clusters","subcounty"), names(df))
+  }
+  
+  long <- df %>%
+    select(any_of(c(id_cols, plot_cols))) %>%
+    pivot_longer(
+      cols = all_of(plot_cols),
+      names_to = c("plot_id", "metric"),
+      names_pattern = "(Plot_\\d+)_(.*)",
+      values_to = "value"
+    ) %>%
+    mutate(metric = stringr::str_replace_all(metric, "\\.+", "."))
+  
+  long <- long %>%
+    mutate(
+      value_chr = as.character(value),
+      is_numeric_value = !is.na(suppressWarnings(as.numeric(value_chr))),
+      metric_lower = tolower(metric)
+    )
+  
+  name_metric_candidates <- long %>%
+    filter(!is_numeric_value) %>%
+    filter(str_detect(metric_lower, "attack|name|plot|location|attacked|attack.at|plotname")) %>%
+    distinct(plot_id, metric) %>%
+    pull(metric)
+  
+  if(length(name_metric_candidates) == 0){
+    short_non_numeric <- long %>% filter(!is_numeric_value) %>% mutate(len = nchar(value_chr)) %>% filter(len > 0 & len < 60)
+    name_metric_candidates <- unique(short_non_numeric$metric)
+  }
+  
+  collapse_first_non_na <- function(x){
+    v <- x[!is.na(x)]
+    if(length(v) == 0) return(NA_character_)
+    as.character(v[1])
+  }
+  
+  group_cols <- c(id_cols, "plot_id", "metric")
+  if(length(id_cols) == 0) group_cols <- c("plot_id", "metric")
+  
+  long_collapsed <- long %>%
+    group_by(across(all_of(group_cols))) %>%
+    summarise(value = collapse_first_non_na(value_chr), .groups = "drop")
+  
+  wide <- long_collapsed %>%
+    pivot_wider(names_from = metric, values_from = value)
+  
+  found_name_col <- NULL
+  if(length(name_metric_candidates) > 0){
+    for(nc in name_metric_candidates){
+      if(nc %in% names(wide)){
+        found_name_col <- nc
+        break
+      }
+    }
+  }
+  
+  if(is.null(found_name_col)){
+    name_col_candidates <- names(wide)[stringr::str_detect(names(wide), regex("name$|plot_name|plotname|plot_\\d+_name|attack.at|attacked", ignore_case = TRUE))]
+    if(length(name_col_candidates)) found_name_col <- name_col_candidates[1]
+  }
+  
+  if(!is.null(found_name_col)){
+    wide <- wide %>% rename(Plot_Name = all_of(found_name_col))
+  } else {
+    text_cols <- names(wide)[vapply(wide, function(x) is.character(x) || is.factor(x), logical(1))]
+    candidate <- NULL
+    for(tc in text_cols){
+      if(tc %in% c("plot_id")) next
+      sample_vals <- na.omit(as.character(wide[[tc]]))
+      if(length(sample_vals) > 0 && mean(nchar(sample_vals)) < 60) { candidate <- tc; break }
+    }
+    if(!is.null(candidate)) wide <- wide %>% rename(Plot_Name = all_of(candidate))
+  }
+  
+  if(!"Plot_Name" %in% names(wide)) wide <- wide %>% mutate(Plot_Name = plot_id)
+  wide <- wide %>% mutate(Plot_Name = na_if(stringr::str_trim(as.character(Plot_Name)), ""))
+  wide <- wide %>% mutate(plot_type = sapply(Plot_Name, derive_plot_type))
+  
+  vig_col <- names(wide)[stringr::str_detect(names(wide), regex("Vigour|Vigor", ignore_case = TRUE))]
+  red_col <- names(wide)[stringr::str_detect(names(wide), regex("Population\\.Reduction|Population_Reduction|PopulationReduction|Population.Reduction", ignore_case = TRUE))]
+  attack_col <- names(wide)[stringr::str_detect(names(wide), regex("Attack|attack|attacked", ignore_case = TRUE))]
+  
+  if(length(vig_col)) wide <- wide %>% rename(Vigour = all_of(vig_col[1]))
+  if(length(red_col)) wide <- wide %>% rename(Population_Reduction = all_of(red_col[1]))
+  if(length(attack_col)) wide <- wide %>% rename(Attack = all_of(attack_col[1]))
+  
+  if("Vigour" %in% names(wide)){
+    suppressWarnings({
+      num_vig <- as.numeric(wide$Vigour)
+      if(sum(!is.na(num_vig)) > 0) wide$Vigour <- num_vig
+    })
+  }
+  if("Population_Reduction" %in% names(wide)){
+    suppressWarnings({
+      num_red <- as.numeric(wide$Population_Reduction)
+      if(sum(!is.na(num_red)) > 0) wide$Population_Reduction <- num_red
+    })
+  }
+  
+  return(wide)
+}
+
+# Detect attack labels encoded in Plot_*_...Attack... columns in a stage dataframe
+# Returns tibble(farmer_name, plot_id, attack_text, attack_label, stage)
+detect_plotname_attack_labels <- function(stage_df, stage_name = NA_character_){
+  if(is.null(stage_df) || nrow(stage_df) == 0) return(tibble())
+  # find columns that look like Plot_1_name_Attack... or similar
+  attack_cols <- names(stage_df)[stringr::str_detect(names(stage_df), regex("^Plot_\\d+_.*Attack", ignore_case = TRUE))]
+  if(length(attack_cols) == 0) return(tibble())
+  # normalize farmer_name column name if needed
+  if(!"farmer_name" %in% names(stage_df) && "Farmer" %in% names(stage_df)){
+    stage_df <- stage_df %>% rename(farmer_name = Farmer)
+  }
+  long <- stage_df %>%
+    select(any_of(c("farmer_name", attack_cols))) %>%
+    pivot_longer(cols = all_of(attack_cols), names_to = "col", values_to = "attack_text") %>%
+    filter(!is.na(attack_text) & str_trim(attack_text) != "") %>%
+    mutate(
+      plot_id = stringr::str_extract(col, "Plot_\\d+"),
+      attack_text = as.character(attack_text),
+      attack_lower = tolower(attack_text),
+      attack_label = case_when(
+        str_detect(attack_lower, "local") ~ "Local",
+        str_detect(attack_lower, "hybrid") ~ "Hybrid",
+        TRUE ~ NA_character_
+      ),
+      stage = stage_name
+    ) %>%
+    select(farmer_name, plot_id, attack_text, attack_label, stage) %>%
+    distinct()
+  long
+}
+
+# helper to extract variety heuristically (used earlier in examples)
+extract_variety <- function(x){
+  x <- as.character(x)
+  x[is.na(x)] <- ""
+  v <- x
+  v <- str_replace_all(v, "_", " ")
+  v <- str_replace_all(v, "\\s+", " ")
+  res <- ifelse(
+    str_detect(tolower(v), "hybrid[:\\-\\s]"),
+    str_trim(str_remove(tolower(v), ".*hybrid[:\\-\\s]*")),
+    ifelse(
+      str_detect(tolower(v), "local[:\\-\\s]"),
+      str_trim(str_remove(tolower(v), ".*local[:\\-\\s]*")),
+      ifelse(str_detect(v, "\\("),
+             str_trim(str_extract(v, "(?<=\\().+?(?=\\))")),
+             str_trim(ifelse(str_detect(v, " - "), str_trim(word(v, -2, -1, sep = " - ")), word(v, 1, 3))))
+    )
+  )
+  toupper(str_trim(res))
+}
+
+# Minimalist palette
+pal <- c("#2b8cbe","#7bccc4","#fdae61","#d73027","#66c2a5","#8da0cb","#e78ac3")
+
+# -----------------------------
+# UI
+# -----------------------------
+ui <- fluidPage(
+  titlePanel("Termite FRN Dashboard"),
+  sidebarLayout(
+    sidebarPanel(width=3,
+                 h4("Filters"),
+                 selectInput("org", "Organization", choices = c("All", sort(unique(na.omit(TrialSetup_data$organization)))), selected="All"),
+                 selectInput("farmer", "Farmer", choices = c("All", sort(unique(na.omit(TrialSetup_data$farmer_name)))), selected="All"),
+                 selectInput("local_maize", "Local Maize Planted", choices = c("All", sort(unique(na.omit(TrialSetup_data$local_maize_planted)))), selected="All"),
+                 selectInput("hybrid_maize", "Hybrid Maize Planted", choices = c("All", sort(unique(na.omit(TrialSetup_data$hybrid_maize_planted)))), selected="All"),
+                 selectInput("plot_type", "Plot Type", choices = c("All", "Hybrid","Lablab","Local Maize","Farmer Choice","Other"), selected="All"),
+                 radioButtons("group_by", "Group charts by", choices = c("Plot","Farmer"), selected = "Plot"),
+                 hr(),
+                 helpText("Hover charts for details. Filters apply across all pages.")
+    ),
+    mainPanel(width=9,
+              tabsetPanel(
+                tabPanel("Overview",
+                         fluidRow(column(12, wellPanel(
+                           h4("Key Metrics"),
+                           fluidRow(column(6, strong("Farmers"), textOutput("k_farmers")),
+                                    column(6, strong("Organizations"), textOutput("k_orgs"))),
+                           fluidRow(column(6, strong("Avg plot size"), textOutput("k_plot_size")),
+                                    column(6, strong("Avg plant loss"), textOutput("k_loss")))
+                         ))),
+                         fluidRow(column(12, leafletOutput("map", height=420))),
+                         fluidRow(column(12, plotlyOutput("trial_choice", height=220)))
+                ),
+                tabPanel("First Weeding",
+                         fluidRow(column(12, plotlyOutput("fw_dates", height=300))),
+                         fluidRow(column(12, plotlyOutput("fw_attack_reduction", height=320))),
+                         fluidRow(column(12, plotlyOutput("fw_termite_signs", height=260))),
+                         fluidRow(column(12, plotlyOutput("fw_termite_locations", height=320))),
+                         fluidRow(column(12, plotlyOutput("fw_vigour", height=320))),
+                         fluidRow(column(12, plotlyOutput("fw_pests_moisture", height=260)))
+                ),
+                tabPanel("Second Weeding",
+                         fluidRow(column(12, plotlyOutput("sw_dates", height=300))),
+                         fluidRow(column(12, plotlyOutput("sw_attack_reduction", height=320))),
+                         fluidRow(column(12, plotlyOutput("sw_vigour", height=320))),
+                         fluidRow(column(12, plotlyOutput("sw_termite_locations", height=320)))
+                ),
+                tabPanel("Tasseling",
+                         fluidRow(column(12, plotlyOutput("ts_vigour", height=320))),
+                         fluidRow(column(12, plotlyOutput("ts_attack_reduction", height=320))),
+                         fluidRow(column(12, plotlyOutput("ts_termite_locations", height=320))),
+                         fluidRow(column(12, plotlyOutput("ts_pests_moisture", height=260)))
+                ),
+                tabPanel("Harvesting",
+                         fluidRow(column(12, plotlyOutput("hv_loss_by_plot", height=320))),
+                         fluidRow(column(12, plotlyOutput("hv_inputs", height=300))),
+                         fluidRow(column(12, plotlyOutput("hv_stage_loss", height=260))),
+                         fluidRow(column(12, plotlyOutput("hv_vigour", height=320)))
+                ),
+                tabPanel("Variety Attack",
+                        # helpText("Note: there are no direct numeric fields for 'proportion attacked'. Proportions are inferred from Plot_*_...Attack... columns (e.g., Plot_1_name_Attack.at.Second.Weeding). When those entries mention 'local' or 'hybrid' we map the attack to the farmer's Trial_setup variety and compute proportions from those inferred counts."),
+                         fluidRow(column(12, plotlyOutput("variety_attack_dots", height = 520))),
+                         fluidRow(column(12, plotlyOutput("variety_attack_bars", height = 420))),
+                         fluidRow(column(12, DT::dataTableOutput("variety_attack_table")))
+                )
+              )
+    )
+  )
+)
+
+# -----------------------------
+# SERVER
+# -----------------------------
+server <- function(input, output, session){
+  # Global filtered TrialSetup for overview and map
+  trial_filtered <- reactive({
+    df <- TrialSetup_data
+    if(input$org != "All") df <- df %>% filter(organization == input$org)
+    if(input$farmer != "All") df <- df %>% filter(farmer_name == input$farmer)
+    if(input$local_maize != "All") df <- df %>% filter(local_maize_planted == input$local_maize)
+    if(input$hybrid_maize != "All") df <- df %>% filter(hybrid_maize_planted == input$hybrid_maize)
+    df
+  })
+  
+  # Stage-specific filtered datasets (semi_join by farmer_name so filters cut across pages)
+  first_filtered <- reactive({
+    base <- FirstWeeding_data
+    if(nrow(trial_filtered())>0) base <- base %>% semi_join(trial_filtered(), by = "farmer_name")
+    base
+  })
+  second_filtered <- reactive({
+    base <- SecondWeeding_data
+    if(nrow(trial_filtered())>0) base <- base %>% semi_join(trial_filtered(), by = "farmer_name")
+    base
+  })
+  tassel_filtered <- reactive({
+    base <- Tasseling_data
+    if(nrow(trial_filtered())>0) base <- base %>% semi_join(trial_filtered(), by = "farmer_name")
+    base
+  })
+  harvest_filtered <- reactive({
+    base <- Harvest_data
+    if(nrow(trial_filtered())>0) base <- base %>% semi_join(trial_filtered(), by = "farmer_name")
+    base
+  })
+  
+  # Filtered tidy plot tables (apply plot_type filter to Plot_Name content)
+  plots_first_f <- reactive({
+    df <- tidy_plots(first_filtered())
+    if(nrow(df) == 0) return(df)
+    if(input$plot_type != "All"){
+      df <- df %>% filter(plot_type == input$plot_type)
+    }
+    df
+  })
+  plots_second_f <- reactive({
+    df <- tidy_plots(second_filtered())
+    if(nrow(df) == 0) return(df)
+    if(input$plot_type != "All"){
+      df <- df %>% filter(plot_type == input$plot_type)
+    }
+    df
+  })
+  plots_tassel_f <- reactive({
+    df <- tidy_plots(tassel_filtered())
+    if(nrow(df) == 0) return(df)
+    if(input$plot_type != "All"){
+      df <- df %>% filter(plot_type == input$plot_type)
+    }
+    df
+  })
+  plots_harvest_f <- reactive({
+    df <- tidy_plots(harvest_filtered())
+    if(nrow(df) == 0) return(df)
+    if(input$plot_type != "All"){
+      df <- df %>% filter(plot_type == input$plot_type)
+    }
+    df
+  })
+  
+  # Helper: return grouping variable name and label depending on toggle
+  group_var <- reactive({
+    if(input$group_by == "Plot") return(list(var = "Plot_Name", label = "Plot"))
+    return(list(var = "farmer_name", label = "Farmer"))
+  })
+  
+  # KPI outputs
+  output$k_farmers <- renderText({ n_distinct(na.omit(TrialSetup_data$farmer_name)) })
+  output$k_orgs <- renderText({ n_distinct(na.omit(TrialSetup_data$organization)) })
+  output$k_plot_size <- renderText({
+    col <- names(TrialSetup_data)[str_detect(names(TrialSetup_data), regex("plot_size|general_plot_size", ignore_case=TRUE))]
+    if(length(col)) {
+      mean_val <- suppressWarnings(mean(as.numeric(TrialSetup_data[[col[1]]]), na.rm=TRUE))
+      if(is.na(mean_val)) return("n/a")
+      paste0(round(mean_val,1))
+    } else "n/a"
+  })
+  output$k_loss <- renderText({
+    col <- names(Harvest_data)[str_detect(names(Harvest_data), regex("plant_loss|Population.Reduction|Population_Reduction", ignore_case=TRUE))]
+    if(length(col)){
+      vals <- Harvest_data %>% select(all_of(col)) %>% unlist() %>% as.numeric()
+      paste0(round(mean(vals, na.rm=TRUE),1), "%")
+    } else "n/a"
+  })
+  
+  # Map (uses trial_filtered)
+  output$map <- renderLeaflet({
+    df <- trial_filtered()
+    if("geolocation" %in% names(df)){
+      coords <- df %>% tidyr::separate(geolocation, into=c("lat","lon"), sep=" ", convert=TRUE, fill="right")
+      coords <- coords %>% filter(!is.na(lat) & !is.na(lon))
+      m <- leaflet() %>% addTiles()
+      if(nrow(coords)){
+        m <- m %>% addCircleMarkers(data=coords, lng=~lon, lat=~lat,
+                                    popup=~paste0("<b>",farmer_name,"</b><br>",organization),
+                                    radius=6, color=pal[1], fillOpacity=0.8)
+      }
+      m
+    } else {
+      leaflet() %>% addTiles()
+    }
+  })
+  
+  output$trial_choice <- renderPlotly({
+    df <- trial_filtered() %>% select(trial_plot_farmer_choice) %>% filter(!is.na(trial_plot_farmer_choice))
+    if(nrow(df)==0) return(plotly_empty())
+    p <- ggplot(df, aes(x=trial_plot_farmer_choice, fill=trial_plot_farmer_choice)) +
+      geom_bar() + theme_minimal() + labs(title="Trial Plot Farmer Choice", x=NULL, y="Count") +
+      theme(legend.position="none")
+    ggplotly(p)
+  })
+  
+  # ---------- First Weeding ----------
+  output$fw_dates <- renderPlotly({
+    grp <- group_var()$var
+    if(grp == "Plot_Name"){
+      plots_df <- plots_first_f()
+      dates_df <- first_filtered() %>% select(farmer_name, first_weeding_date) %>% distinct()
+      df <- plots_df %>% left_join(dates_df, by = "farmer_name") %>% filter(!is.na(first_weeding_date), !is.na(Plot_Name))
+      if(nrow(df) == 0) return(plotly_empty())
+      p <- ggplot(df, aes(x = fct_reorder(Plot_Name, first_weeding_date, .fun = median, .na_rm = TRUE),
+                          y = first_weeding_date,
+                          text = paste("Plot:", Plot_Name, "<br>Farmer:", farmer_name, "<br>Date:", first_weeding_date))) +
+        geom_jitter(width = 0.2, height = 0, size = 2, color = pal[1], alpha = 0.8) +
+        labs(title = "First Weeding Date by Plot", x = "Plot Type / Name", y = "Date") +
+        theme_minimal()
+      ggplotly(p, tooltip = "text")
+    } else {
+      df <- first_filtered() %>% select(farmer_name, first_weeding_date) %>% distinct() %>% filter(!is.na(first_weeding_date))
+      if(nrow(df) == 0) return(plotly_empty())
+      p <- ggplot(df, aes(x = fct_reorder(farmer_name, first_weeding_date, .fun = median, .na_rm = TRUE),
+                          y = first_weeding_date,
+                          text = paste("Farmer:", farmer_name, "<br>Date:", first_weeding_date))) +
+        geom_jitter(width = 0.2, height = 0, size = 2, color = pal[1], alpha = 0.8) +
+        labs(title = "First Weeding Date by Farmer", x = "Farmer", y = "Date") +
+        theme_minimal()
+      ggplotly(p, tooltip = "text")
+    }
+  })
+  
+  output$fw_attack_reduction <- renderPlotly({
+    grp <- group_var()$var
+    if(grp == "Plot_Name"){
+      df <- plots_first_f() %>% filter(!is.na(Plot_Name) & !is.na(Population_Reduction))
+      if(nrow(df)==0) return(plotly_empty())
+      df2 <- df %>% group_by(Plot_Name, Population_Reduction) %>% summarise(n=n(), .groups="drop")
+      p <- ggplot(df2, aes(x=fct_reorder(Plot_Name, -n), y=n, fill=as.factor(Population_Reduction), text=paste("Plot:", Plot_Name))) +
+        geom_col() + labs(title="Plots attacked stacked by Population Reduction (First Weeding)", x="Plot", y="Count") +
+        theme_minimal()
+      ggplotly(p, tooltip="text")
+    } else {
+      df <- first_filtered() %>% filter(!is.na(farmer_name) & !is.na(signs_termite_attack))
+      if(nrow(df)==0) return(plotly_empty())
+      df2 <- df %>% group_by(farmer_name, signs_termite_attack) %>% summarise(n=n(), .groups="drop")
+      p <- ggplot(df2, aes(x=fct_reorder(farmer_name, -n), y=n, fill=as.factor(signs_termite_attack), text=paste("Farmer:", farmer_name))) +
+        geom_col() + labs(title="Termite signs by Farmer (First Weeding)", x="Farmer", y="Count") +
+        theme_minimal()
+      ggplotly(p, tooltip="text")
+    }
+  })
+  
+  output$fw_termite_signs <- renderPlotly({
+    df <- first_filtered() %>% filter(!is.na(signs_termite_attack))
+    if(nrow(df)==0) return(plotly_empty())
+    p <- ggplot(df, aes(x=signs_termite_attack)) + geom_bar(fill=pal[4]) + theme_minimal() + labs(title="Signs of Termite Attack (First Weeding)", x=NULL, y="Count")
+    ggplotly(p)
+  })
+  
+  output$fw_termite_locations <- renderPlotly({
+    df <- first_filtered() %>% filter(!is.na(Location_1_Termite_attacked) & !is.na(Location_1_Termite_Name))
+    if(nrow(df)==0) return(plotly_empty())
+    df2 <- df %>% group_by(Location_1_Termite_attacked, Location_1_Termite_Name) %>% summarise(n=n(), .groups="drop")
+    p <- ggplot(df2, aes(x=fct_reorder(Location_1_Termite_attacked, -n), y=n, fill=Location_1_Termite_Name, text=paste("Name:", Location_1_Termite_Name))) +
+      geom_col(position="stack") + theme_minimal() + labs(title="Termite Names vs Locations (First Weeding)", x="Location", y="Count")
+    ggplotly(p, tooltip="text")
+  })
+  
+  output$fw_vigour <- renderPlotly({
+    grp <- group_var()$var
+    if(grp == "Plot_Name"){
+      df <- plots_first_f() %>% filter(!is.na(Plot_Name) & !is.na(Vigour))
+      if(nrow(df)==0) return(plotly_empty())
+      df2 <- df %>% group_by(Plot_Name, Vigour) %>% summarise(n=n(), .groups="drop")
+      p <- ggplot(df2, aes(x=fct_reorder(Plot_Name, -n), y=n, fill=as.factor(Vigour), text=paste("Plot:", Plot_Name))) +
+        geom_col() + theme_minimal() + labs(title="Vigour by Plot (First Weeding)", x="Plot", y="Count")
+      ggplotly(p, tooltip="text")
+    } else {
+      df <- first_filtered() %>% filter(!is.na(farmer_name) & !is.na(signs_termite_attack))
+      if(nrow(df)==0) return(plotly_empty())
+      df2 <- df %>% group_by(farmer_name, signs_termite_attack) %>% summarise(n=n(), .groups="drop")
+      p <- ggplot(df2, aes(x=fct_reorder(farmer_name, -n), y=n, fill=as.factor(signs_termite_attack), text=paste("Farmer:", farmer_name))) +
+        geom_col() + theme_minimal() + labs(title="Termite signs by Farmer (First Weeding)", x="Farmer", y="Count")
+      ggplotly(p, tooltip="text")
+    }
+  })
+  
+  output$fw_pests_moisture <- renderPlotly({
+    df <- first_filtered() %>% select(any_of(c("pests_diseases","moisture_stress"))) %>% pivot_longer(everything(), names_to="cat", values_to="val") %>% filter(!is.na(val))
+    if(nrow(df)==0) return(plotly_empty())
+    p <- ggplot(df, aes(x=cat, fill=val)) + geom_bar(position="stack") + theme_minimal() + labs(title="Pests and Moisture (First Weeding)", x=NULL, y="Count")
+    ggplotly(p)
+  })
+  
+  # ---------- Second Weeding ----------
+  output$sw_dates <- renderPlotly({
+    grp <- group_var()$var
+    if(grp == "Plot_Name"){
+      plots_df <- plots_second_f()
+      dates_df <- second_filtered() %>% select(farmer_name, Second_Weeding_Date) %>% distinct()
+      df <- plots_df %>% left_join(dates_df, by = "farmer_name") %>% filter(!is.na(Second_Weeding_Date), !is.na(Plot_Name))
+      if(nrow(df) == 0) return(plotly_empty())
+      p <- ggplot(df, aes(x = fct_reorder(Plot_Name, Second_Weeding_Date, .fun = median, .na_rm = TRUE),
+                          y = Second_Weeding_Date,
+                          text = paste("Plot:", Plot_Name, "<br>Farmer:", farmer_name, "<br>Date:", Second_Weeding_Date))) +
+        geom_jitter(width = 0.2, height = 0, size = 2, color = pal[2], alpha = 0.8) +
+        labs(title = "Second Weeding Date by Plot", x = "Plot Type / Name", y = "Date") +
+        theme_minimal()
+      ggplotly(p, tooltip = "text")
+    } else {
+      df <- second_filtered() %>% select(farmer_name, Second_Weeding_Date) %>% distinct() %>% filter(!is.na(Second_Weeding_Date))
+      if(nrow(df) == 0) return(plotly_empty())
+      p <- ggplot(df, aes(x = fct_reorder(farmer_name, Second_Weeding_Date, .fun = median, .na_rm = TRUE),
+                          y = Second_Weeding_Date,
+                          text = paste("Farmer:", farmer_name, "<br>Date:", Second_Weeding_Date))) +
+        geom_jitter(width = 0.2, height = 0, size = 2, color = pal[2], alpha = 0.8) +
+        labs(title = "Second Weeding Date by Farmer", x = "Farmer", y = "Date") +
+        theme_minimal()
+      ggplotly(p, tooltip = "text")
+    }
+  })
+  
+  output$sw_attack_reduction <- renderPlotly({
+    grp <- group_var()$var
+    if(grp == "Plot_Name"){
+      df <- plots_second_f() %>% filter(!is.na(Plot_Name) & !is.na(Population_Reduction))
+      if(nrow(df)==0) return(plotly_empty())
+      df2 <- df %>% group_by(Plot_Name, Population_Reduction) %>% summarise(n=n(), .groups="drop")
+      p <- ggplot(df2, aes(x=fct_reorder(Plot_Name, -n), y=n, fill=as.factor(Population_Reduction), text=paste("Plot:", Plot_Name))) +
+        geom_col() + theme_minimal() + labs(title="Attack vs Population Reduction (Second Weeding)", x="Plot", y="Count")
+      ggplotly(p, tooltip="text")
+    } else {
+      df <- second_filtered() %>% filter(!is.na(farmer_name) & !is.na(signs_termite_attack))
+      if(nrow(df)==0) return(plotly_empty())
+      df2 <- df %>% group_by(farmer_name, signs_termite_attack) %>% summarise(n=n(), .groups="drop")
+      p <- ggplot(df2, aes(x=fct_reorder(farmer_name, -n), y=n, fill=as.factor(signs_termite_attack), text=paste("Farmer:", farmer_name))) +
+        geom_col() + theme_minimal() + labs(title="Termite signs by Farmer (Second Weeding)", x="Farmer", y="Count")
+      ggplotly(p, tooltip="text")
+    }
+  })
+  
+  output$sw_vigour <- renderPlotly({
+    grp <- group_var()$var
+    if(grp == "Plot_Name"){
+      df <- plots_second_f() %>% filter(!is.na(Plot_Name) & !is.na(Vigour))
+      if(nrow(df)==0) return(plotly_empty())
+      df2 <- df %>% group_by(Plot_Name, Vigour) %>% summarise(n=n(), .groups="drop")
+      p <- ggplot(df2, aes(x=fct_reorder(Plot_Name, -n), y=n, fill=as.factor(Vigour), text=paste("Plot:", Plot_Name))) +
+        geom_col() + theme_minimal() + labs(title="Vigour by Plot (Second Weeding)", x="Plot", y="Count")
+      ggplotly(p, tooltip="text")
+    } else {
+      df <- second_filtered() %>% filter(!is.na(farmer_name) & !is.na(signs_termite_attack))
+      if(nrow(df)==0) return(plotly_empty())
+      df2 <- df %>% group_by(farmer_name, signs_termite_attack) %>% summarise(n=n(), .groups="drop")
+      p <- ggplot(df2, aes(x=fct_reorder(farmer_name, -n), y=n, fill=as.factor(signs_termite_attack), text=paste("Farmer:", farmer_name))) +
+        geom_col() + theme_minimal() + labs(title="Termite signs by Farmer (Second Weeding)", x="Farmer", y="Count")
+      ggplotly(p, tooltip="text")
+    }
+  })
+  
+  output$sw_termite_locations <- renderPlotly({
+    df <- second_filtered() %>% filter(!is.na(Location_1_Termite_attacked) & !is.na(Location_1_Termite_Name))
+    if(nrow(df)==0) return(plotly_empty())
+    df2 <- df %>% group_by(Location_1_Termite_attacked, Location_1_Termite_Name) %>% summarise(n=n(), .groups="drop")
+    p <- ggplot(df2, aes(x=fct_reorder(Location_1_Termite_attacked, -n), y=n, fill=Location_1_Termite_Name, text=paste("Name:", Location_1_Termite_Name))) +
+      geom_col(position="stack") + theme_minimal() + labs(title="Termite Names vs Locations (Second Weeding)", x="Location", y="Count")
+    ggplotly(p, tooltip="text")
+  })
+  
+  # ---------- Tasseling ----------
+  output$ts_vigour <- renderPlotly({
+    grp <- group_var()$var
+    if(grp == "Plot_Name"){
+      df <- plots_tassel_f() %>% filter(!is.na(Plot_Name) & !is.na(Vigour))
+      if(nrow(df)==0) return(plotly_empty())
+      df2 <- df %>% group_by(Plot_Name, Vigour) %>% summarise(n=n(), .groups="drop")
+      p <- ggplot(df2, aes(x=fct_reorder(Plot_Name, -n), y=n, fill=as.factor(Vigour), text=paste("Plot:", Plot_Name))) +
+        geom_col() + theme_minimal() + labs(title="Vigour by Plot (Tasseling)", x="Plot", y="Count")
+      ggplotly(p, tooltip="text")
+    } else {
+      df <- tassel_filtered() %>% filter(!is.na(farmer_name) & !is.na(signs_termite_attack))
+      if(nrow(df)==0) return(plotly_empty())
+      df2 <- df %>% group_by(farmer_name, signs_termite_attack) %>% summarise(n=n(), .groups="drop")
+      p <- ggplot(df2, aes(x=fct_reorder(farmer_name, -n), y=n, fill=as.factor(signs_termite_attack), text=paste("Farmer:", farmer_name))) +
+        geom_col() + theme_minimal() + labs(title="Termite signs by Farmer (Tasseling)", x="Farmer", y="Count")
+      ggplotly(p, tooltip="text")
+    }
+  })
+  
+  output$ts_attack_reduction <- renderPlotly({
+    df <- plots_tassel_f() %>% filter(!is.na(Plot_Name) & !is.na(Population_Reduction))
+    if(nrow(df)==0) return(plotly_empty())
+    df2 <- df %>% group_by(Plot_Name, Population_Reduction) %>% summarise(n=n(), .groups="drop")
+    p <- ggplot(df2, aes(x=fct_reorder(Plot_Name, -n), y=n, fill=as.factor(Population_Reduction), text=paste("Plot:", Plot_Name))) +
+      geom_col() + theme_minimal() + labs(title="Attack vs Population Reduction (Tasseling)", x="Plot", y="Count")
+    ggplotly(p, tooltip="text")
+  })
+  
+  output$ts_termite_locations <- renderPlotly({
+    df <- tassel_filtered() %>% filter(!is.na(Location_1_Termite_attacked) & !is.na(Location_1_Termite_Name))
+    if(nrow(df)==0) return(plotly_empty())
+    df2 <- df %>% group_by(Location_1_Termite_attacked, Location_1_Termite_Name) %>% summarise(n=n(), .groups="drop")
+    p <- ggplot(df2, aes(x=fct_reorder(Location_1_Termite_attacked, -n), y=n, fill=Location_1_Termite_Name, text=paste("Name:", Location_1_Termite_Name))) +
+      geom_col(position="stack") + theme_minimal() + labs(title="Termite Names vs Locations (Tasseling)", x="Location", y="Count")
+    ggplotly(p, tooltip="text")
+  })
+  
+  output$ts_pests_moisture <- renderPlotly({
+    df <- tassel_filtered() %>% select(any_of(c("pests_diseases","moisture_stress"))) %>% pivot_longer(everything(), names_to="cat", values_to="val") %>% filter(!is.na(val))
+    if(nrow(df)==0) return(plotly_empty())
+    p <- ggplot(df, aes(x=cat, fill=val)) + geom_bar(position="stack") + theme_minimal() + labs(title="Pests & Moisture (Tasseling)", x=NULL, y="Count")
+    ggplotly(p)
+  })
+  
+  # ---------- Harvesting ----------
+  output$hv_loss_by_plot <- renderPlotly({
+    grp <- group_var()$var
+    if(grp == "Plot_Name"){
+      df <- plots_harvest_f() %>% filter(!is.na(Plot_Name) & !is.na(Population_Reduction))
+      if(nrow(df)==0) return(plotly_empty())
+      numeric_loss <- suppressWarnings(as.numeric(df$Population_Reduction))
+      if(sum(!is.na(numeric_loss))>0){
+        df$loss_num <- numeric_loss
+        p <- ggplot(df, aes(x=Plot_Name, y=loss_num, text=paste("Farmer:", farmer_name))) + geom_boxplot() + theme_minimal() + labs(title="Plant Loss by Plot (Harvesting)", x="Plot", y="Loss")
+      } else {
+        df2 <- df %>% group_by(Plot_Name, Population_Reduction) %>% summarise(n=n(), .groups="drop")
+        p <- ggplot(df2, aes(x=fct_reorder(Plot_Name, -n), y=n, fill=as.factor(Population_Reduction), text=paste("Plot:", Plot_Name))) + geom_col() + theme_minimal() + labs(title="Plant Loss by Plot (Harvesting)", x="Plot", y="Count")
+      }
+      ggplotly(p, tooltip="text")
+    } else {
+      df <- harvest_filtered() %>% filter(!is.na(farmer_name) & !is.na(stage_most_plants_lost))
+      if(nrow(df)==0) return(plotly_empty())
+      df2 <- df %>% group_by(farmer_name, stage_most_plants_lost) %>% summarise(n=n(), .groups="drop")
+      p <- ggplot(df2, aes(x=fct_reorder(farmer_name, -n), y=n, fill=as.factor(stage_most_plants_lost), text=paste("Farmer:", farmer_name))) + geom_col() + theme_minimal() + labs(title="Stage Most Plants Lost by Farmer", x="Farmer", y="Count")
+      ggplotly(p, tooltip="text")
+    }
+  })
+  
+  output$hv_inputs <- renderPlotly({
+    df <- harvest_filtered() %>% select(any_of(c("supplementary_fertilizer_used","biopesticide_use","prcatice_ca"))) %>% pivot_longer(everything(), names_to="input", values_to="val") %>% filter(!is.na(val))
+    if(nrow(df)==0) return(plotly_empty())
+    p <- ggplot(df, aes(x=input, fill=val)) + geom_bar(position="stack") + theme_minimal() + labs(title="Inputs at Harvest", x=NULL, y="Count")
+    ggplotly(p)
+  })
+  
+  output$hv_stage_loss <- renderPlotly({
+    df <- harvest_filtered() %>% filter(!is.na(stage_most_plants_lost))
+    if(nrow(df)==0) return(plotly_empty())
+    p <- ggplot(df, aes(x=stage_most_plants_lost)) + geom_bar(fill=pal[4]) + theme_minimal() + labs(title="Stage Most Plants Lost", x=NULL, y="Count")
+    ggplotly(p)
+  })
+  
+  output$hv_vigour <- renderPlotly({
+    grp <- group_var()$var
+    if(grp == "Plot_Name"){
+      df <- plots_harvest_f() %>% filter(!is.na(Plot_Name) & !is.na(Vigour))
+      if(nrow(df)==0) return(plotly_empty())
+      df2 <- df %>% group_by(Plot_Name, Vigour) %>% summarise(n=n(), .groups="drop")
+      p <- ggplot(df2, aes(x=fct_reorder(Plot_Name, -n), y=n, fill=as.factor(Vigour), text=paste("Plot:", Plot_Name))) + geom_col() + theme_minimal() + labs(title="Vigour by Plot (Harvest)", x="Plot", y="Count")
+      ggplotly(p, tooltip="text")
+    } else {
+      df <- harvest_filtered() %>% filter(!is.na(farmer_name) & !is.na(stage_most_plants_lost))
+      if(nrow(df)==0) return(plotly_empty())
+      df2 <- df %>% group_by(farmer_name, stage_most_plants_lost) %>% summarise(n=n(), .groups="drop")
+      p <- ggplot(df2, aes(x=fct_reorder(farmer_name, -n), y=n, fill=as.factor(stage_most_plants_lost), text=paste("Farmer:", farmer_name))) + geom_col() + theme_minimal() + labs(title="Vigour/Stage by Farmer (Harvest)", x="Farmer", y="Count")
+      ggplotly(p, tooltip="text")
+    }
+  })
+  
+  # -----------------------------
+  # Variety Attack: dot-plot, bars, table guided by TrialSetup_data
+  # Uses detect_plotname_attack_labels() to infer whether Plot_*_...Attack... mentions local/hybrid
+  # -----------------------------
+  build_plot_level_with_inferred_attacks <- function(){
+    p1 <- plots_first_f(); p2 <- plots_second_f(); p3 <- plots_tassel_f(); p4 <- plots_harvest_f()
+    all_plots <- bind_rows(
+      if(nrow(p1)) p1 %>% mutate(stage = "First") else tibble(),
+      if(nrow(p2)) p2 %>% mutate(stage = "Second") else tibble(),
+      if(nrow(p3)) p3 %>% mutate(stage = "Tassel") else tibble(),
+      if(nrow(p4)) p4 %>% mutate(stage = "Harvest") else tibble()
+    )
+    if(nrow(all_plots) == 0) return(tibble())
+    
+    # collect attack labels from raw stage sheets
+    attacks_first  <- detect_plotname_attack_labels(first_filtered(),  "First")
+    attacks_second <- detect_plotname_attack_labels(second_filtered(), "Second")
+    attacks_tassel <- detect_plotname_attack_labels(tassel_filtered(), "Tassel")
+    attacks_harvest<- detect_plotname_attack_labels(harvest_filtered(), "Harvest")
+    attacks_all <- bind_rows(attacks_first, attacks_second, attacks_tassel, attacks_harvest)
+    
+    # normalize and ensure plot_id exists
+    all_plots <- all_plots %>%
+      mutate(
+        Plot_Name = as.character(Plot_Name),
+        plot_id = ifelse(!is.na(plot_id), plot_id, stringr::str_extract(Plot_Name, "Plot_\\d+")),
+        farmer_name = as.character(farmer_name),
+        Attack = if("Attack" %in% names(all_plots)) as.character(Attack) else NA_character_,
+        Population_Reduction = if("Population_Reduction" %in% names(all_plots)) as.character(Population_Reduction) else NA_character_
+      )
+    
+    # join attack labels
+    if(nrow(attacks_all) > 0){
+      all_plots <- all_plots %>%
+        left_join(attacks_all %>% select(farmer_name, plot_id, attack_label) %>% distinct(),
+                  by = c("farmer_name", "plot_id"))
+    } else {
+      all_plots$attack_label <- NA_character_
+    }
+    
+    # compute attacked flags (metric OR label)
+    all_plots <- all_plots %>%
+      mutate(
+        attacked_flag_metric = case_when(
+          !is.na(Attack) & str_detect(tolower(Attack), "yes|attacked|true|1") ~ 1,
+          !is.na(Population_Reduction) & suppressWarnings(as.numeric(Population_Reduction)) > 0 ~ 1,
+          TRUE ~ 0
+        ),
+        attacked_flag_label = case_when(
+          attack_label == "Local"  ~ 1,
+          attack_label == "Hybrid" ~ 1,
+          TRUE ~ 0
+        ),
+        attacked_flag = pmax(attacked_flag_metric, attacked_flag_label, na.rm = TRUE)
+      )
+    
+    # attach authoritative variety names from TrialSetup_data
+    trial_varieties <- TrialSetup_data %>%
+      transmute(farmer_name = as.character(farmer_name),
+                local_variety = as.character(local_maize_planted),
+                hybrid_variety = as.character(hybrid_maize_planted)) %>%
+      distinct()
+    
+    all_plots <- all_plots %>%
+      left_join(trial_varieties, by = "farmer_name") %>%
+      mutate(
+        plot_type = ifelse(is.na(plot_type) | plot_type == "",
+                           case_when(
+                             str_detect(tolower(Plot_Name), "hybrid") ~ "Hybrid",
+                             str_detect(tolower(Plot_Name), "local")  ~ "Local Maize",
+                             TRUE ~ NA_character_
+                           ), plot_type),
+        variety = case_when(
+          plot_type == "Hybrid"    ~ ifelse(!is.na(hybrid_variety) & hybrid_variety != "", hybrid_variety, "UNKNOWN_HYBRID"),
+          plot_type == "Local Maize" ~ ifelse(!is.na(local_variety) & local_variety != "", local_variety, "UNKNOWN_LOCAL"),
+          TRUE ~ "OTHER"
+        ),
+        variety = str_trim(as.character(variety))
+      )
+    
+    all_plots
+  }
+  
+  output$variety_attack_dots <- renderPlotly({
+    all_plots <- build_plot_level_with_inferred_attacks()
+    if(nrow(all_plots) == 0) return(plotly_empty())
+    
+    focus <- all_plots %>% filter(plot_type %in% c("Hybrid","Local Maize") & variety != "" & variety != "OTHER" & attacked_flag == 1)
+    if(nrow(focus) == 0) return(plotly_empty())
+    
+    dots <- focus %>%
+      distinct(farmer_name, plot_type, variety, Plot_Name) %>%
+      group_by(farmer_name, plot_type, variety) %>%
+      summarise(attacked_plots = n_distinct(Plot_Name), .groups = "drop") %>%
+      mutate(variety_label = paste0(plot_type, " | ", toupper(variety)),
+             farmer_name = as.character(farmer_name))
+    
+    farmer_order <- dots %>%
+      group_by(farmer_name) %>%
+      summarise(total_attacked = sum(attacked_plots, na.rm = TRUE)) %>%
+      arrange(desc(total_attacked)) %>%
+      pull(farmer_name)
+    
+    dots <- dots %>% mutate(farmer_name = factor(farmer_name, levels = farmer_order))
+    
+    variety_order <- dots %>%
+      group_by(variety_label) %>%
+      summarise(total_attacked = sum(attacked_plots, na.rm = TRUE)) %>%
+      arrange(desc(total_attacked)) %>%
+      pull(variety_label)
+    
+    dots <- dots %>% mutate(variety_label = factor(variety_label, levels = variety_order))
+    
+    p <- ggplot(dots, aes(x = variety_label, y = farmer_name, size = attacked_plots, color = plot_type,
+                          text = paste0("Farmer: ", farmer_name,
+                                        "<br>Variety: ", variety_label,
+                                        "<br>Attacked plots: ", attacked_plots))) +
+      geom_point(alpha = 0.9) +
+      scale_size_continuous(range = c(4, 12)) +
+      labs(title = "Attacked maize varieties per farmer",
+           x = "Variety (type | name)", y = "Farmer", size = "Attacked plots", color = "Plot type") +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+    
+    ggplotly(p, tooltip = "text") %>% layout(legend = list(x = 0.85, y = 0.95), margin = list(b = 200))
+  })
+  
+  output$variety_attack_bars <- renderPlotly({
+    all_plots <- build_plot_level_with_inferred_attacks()
+    if(nrow(all_plots) == 0) return(plotly_empty())
+    
+    focus <- all_plots %>% filter(plot_type %in% c("Hybrid","Local Maize") & !is.na(variety) & variety != "" & variety != "OTHER")
+    if(nrow(focus) == 0) return(plotly_empty())
+    
+    summary_var <- focus %>%
+      group_by(plot_type, variety) %>%
+      summarise(
+        plots_total = n_distinct(Plot_Name),
+        attacked_plots = sum(as.integer(attacked_flag), na.rm = TRUE),
+        prop_attacked = ifelse(plots_total > 0, attacked_plots / plots_total, 0),
+        .groups = "drop"
+      ) %>%
+      arrange(plot_type, desc(prop_attacked))
+    
+    #summary_var <- summary_var %>% mutate(variety_label = paste0(plot_type, " | ", variety),
+     #                                     variety_label = fct_reorder(variety_label, prop_attacked))
+    
+    #p <- ggplot(summary_var, aes(x = variety_label, y = prop_attacked, fill = plot_type,
+   #                              text = paste0("Variety: ", variety,
+    #                                           "<br>Type: ", plot_type,
+     #                                          "<br>Plots total: ", plots_total,
+      #                                         "<br>Attacked: ", attacked_plots,
+       #                                        "<br>Proportion: ", scales::percent(prop_attacked, accuracy = 1)))) +
+      #geom_col(position = position_dodge(width = 0.9), width = 0.8) +
+      #geom_text(aes(label = attacked_plots), position = position_dodge(width = 0.9), vjust = -0.5, size = 3) +
+      #scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
+      #labs(title = "Attack rate by maize variety", x = "Variety (type | name)", y = "Proportion attacked", fill = "Plot type") +
+      #theme_minimal() +
+      #theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+    
+  #  ggplotly(p, tooltip = "text") %>% layout(legend = list(x = 0.8, y = 0.95))
+#  })
+  
+ # output$variety_attack_table <- DT::renderDataTable({
+  #  all_plots <- build_plot_level_with_inferred_attacks()
+   # if(nrow(all_plots) == 0) return(DT::datatable(tibble()))
+    
+  #  focus <- all_plots %>% filter(plot_type %in% c("Hybrid","Local Maize") & variety != "" & variety != "OTHER")
+   # if(nrow(focus) == 0) return(DT::datatable(tibble()))
+    
+  #  summary_tbl <- focus %>%
+   #   group_by(plot_type, variety) %>%
+    #  summarise(total_plots = n_distinct(Plot_Name),
+     #           attacked_plots = sum(attacked_flag, na.rm = TRUE),
+      #          prop_attacked = attacked_plots / (total_plots + 1e-9),
+       #         .groups = "drop") %>%
+      #arrange(desc(prop_attacked), desc(attacked_plots))
+    
+    #DT::datatable(summary_tbl, rownames = FALSE, options = list(pageLength = 10))
+  })
+}
+
+# -----------------------------
+# RUN APP
+# -----------------------------
+shinyApp(ui, server)
