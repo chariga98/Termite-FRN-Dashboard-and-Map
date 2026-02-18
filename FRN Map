@@ -1,0 +1,100 @@
+# 1. LOAD LIBRARIES
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(geodata)
+library(stringr)
+library(ggspatial)
+
+# 2. DOWNLOAD MAP DATA
+kenya_all <- st_as_sf(geodata::gadm("KEN", level = 1, path = tempdir())) %>% st_transform(4326)
+kenya_sub <- st_as_sf(geodata::gadm("KEN", level = 2, path = tempdir())) %>% st_transform(4326)
+
+# 3. PROCESS TRIAL DATA
+parse_geo <- function(x) {
+  nums <- str_extract_all(as.character(x), "-?\\d+\\.?\\d*")
+  lat <- sapply(nums, function(v) if(length(v) >= 1) as.numeric(v[1]) else NA_real_)
+  lon <- sapply(nums, function(v) if(length(v) >= 2) as.numeric(v[2]) else NA_real_)
+  data.frame(lat = lat, lon = lon)
+}
+df_pts <- bind_cols(TrialSetup_data, parse_geo(TrialSetup_data$geolocation)) %>%
+  filter(!is.na(lat) & !is.na(lon)) %>%
+  mutate(new_lat = ifelse(lat > 30 | lat < -10, lon, lat),
+         new_lon = ifelse(lat > 30 | lat < -10, lat, lon)) %>%
+  st_as_sf(coords = c("new_lon","new_lat"), crs = 4326, remove = FALSE)
+
+# 4. ORGANIZATION COLORS (color-blind friendly)
+org_colors <- c(
+  "rfrn"   = "#1F77B4",  # Blue
+  "sofdi"  = "#FF7F0E",  # Orange
+  "tembea" = "#9467BD"   # Purple
+)
+
+# 5. MAIN MAP
+p_main <- ggplot() +
+  geom_sf(data=kenya_all, fill="#FDFDFD", color="#B0B0B0", size=0.3) +
+  geom_sf(data=df_pts, aes(color=organization), size=4, alpha=0.9) +
+  scale_color_manual(values=org_colors) +
+  geom_sf_text(data=kenya_all, aes(label=NAME_1), size=3, color="#34495E") +
+  annotation_scale(location="bl", width_hint=0.3) +
+  annotation_north_arrow(location="tl", which_north="true",
+                         style=north_arrow_fancy_orienteering) +
+  theme_minimal(base_size=14) +
+  theme(panel.background=element_rect(fill="#E6F2FA", color=NA),
+        plot.background=element_rect(fill="#E6F2FA", color=NA),
+        panel.grid=element_blank(),
+        axis.text=element_blank(),
+        axis.title=element_blank(),
+        legend.position="bottom",
+        legend.title=element_blank()) +
+  labs(title="Kenya Termite FRN Research Trial Locations")
+
+# 6. INSETS WITH SUB-COUNTIES
+org_counties <- data.frame(
+  org = c("sofdi","rfrn","tembea"),
+  county = c("Kakamega,Vihiga","Migori","Siaya")
+)
+
+insets <- list()
+for(org in c("sofdi","rfrn","tembea")){
+  county_names <- strsplit(org_counties$county[org_counties$org==org],",")[[1]]
+  sel_c <- kenya_all %>% filter(NAME_1 %in% county_names)
+  sel_sub <- kenya_sub %>% filter(NAME_1 %in% county_names)
+  bbox <- st_bbox(sel_c)
+  
+  title_text <- paste0(toupper(org), " (", paste(county_names, collapse=" & "), ")")
+  
+  inset_plot <- ggplot() +
+    geom_sf(data=sel_sub, fill="white", color="#999999", size=0.4) +
+    geom_sf_text(data=sel_sub, aes(label=NAME_2), size=3, color="#34495E") +
+    geom_sf(data=df_pts %>% filter(tolower(organization)==org),
+            aes(color=organization), size=4, alpha=0.9) +
+    scale_color_manual(values=org_colors) +
+    coord_sf(xlim=c(bbox["xmin"],bbox["xmax"]), ylim=c(bbox["ymin"],bbox["ymax"])) +
+    labs(title=title_text) +
+    theme_void() +
+    theme(plot.background=element_rect(color=org_colors[org], fill="white", size=2.5),
+          plot.margin=margin(10,10,10,10),
+          plot.title=element_text(hjust=0.5, size=16, face="bold",
+                                  color=org_colors[org], margin=margin(b=8)))
+  
+  if(org=="sofdi"){
+    inset_plot <- inset_plot +
+      geom_sf(data=sel_c, fill=NA, color="red", size=1.2)
+  }
+  
+  insets[[org]] <- inset_plot
+}
+
+# 7. COMPOSITION (main map on top, insets below)
+inset_row <- plot_grid(insets$sofdi, insets$rfrn, insets$tembea,
+                       ncol=3, rel_widths=c(1,1,1))
+
+final_plot <- plot_grid(p_main, inset_row,
+                        ncol=1, rel_heights=c(2,1))
+
+# 8. SAVE
+ggsave("Kenya_Termite_FRN_Professional_Map.png", final_plot,
+       width=14, height=16, dpi=400, bg="#E6F2FA")
+
